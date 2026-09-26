@@ -340,6 +340,43 @@ write_service(){
     fi
     return 0
   fi
+  # Auto-detect available RAM and compute Go memory tuning parameters.
+  # This lets 3m-ui run on tiny VPS (128MB) without OOM-killing.
+  if [ -f /proc/meminfo ]; then
+    TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  else
+    TOTAL_KB=0
+  fi
+  TOTAL_MB=$((TOTAL_KB / 1024))
+  if [ -n "${THREE_M_UI_GOMEMLIMIT:-}" ]; then
+    PANEL_GOMEMLIMIT="$THREE_M_UI_GOMEMLIMIT"
+  elif [ "$TOTAL_MB" -gt 0 ] && [ "$TOTAL_MB" -le 128 ]; then
+    PANEL_GOMEMLIMIT="64MiB"
+    PANEL_GOGC="25"
+  elif [ "$TOTAL_MB" -gt 0 ] && [ "$TOTAL_MB" -le 256 ]; then
+    PANEL_GOMEMLIMIT="128MiB"
+    PANEL_GOGC="50"
+  else
+    # >=512MB: no limit (Go default). Use off to disable GOMEMLIMIT.
+    PANEL_GOMEMLIMIT="off"
+    PANEL_GOGC="100"
+  fi
+  # GOGC override
+  if [ -n "${THREE_M_UI_GOGC:-}" ]; then
+    PANEL_GOGC="$THREE_M_UI_GOGC"
+  fi
+  # MemoryMax = 1.5x GOMEMLIMIT (or unlimited if GOMEMLIMIT is off)
+  case "$PANEL_GOMEMLIMIT" in
+    off) PANEL_MEMORYMAX="infinity" ;;
+    *MiB)
+      _raw=$(echo "$PANEL_GOMEMLIMIT" | sed 's/MiB//')
+      _max=$((_raw + _raw / 2))
+      PANEL_MEMORYMAX="${_max}M"
+      ;;
+    *) PANEL_MEMORYMAX="infinity" ;;
+  esac
+  say "Panel memory tuning: GOMEMLIMIT=$PANEL_GOMEMLIMIT GOGC=$PANEL_GOGC MemoryMax=$PANEL_MEMORYMAX (host RAM: ${TOTAL_MB}MB)"
+
   mkdir -p "$(dirname "$UNIT")"
   if [ "$INIT" = systemd ]; then
     cat > "$UNIT" <<UNITFILE
@@ -351,6 +388,15 @@ Wants=network-online.target
 Type=simple
 ExecStart=$APP_BIN
 Environment=THREE_M_UI_CONFIG=$CONFIG_FILE
+# Go runtime memory tuning — auto-scaled based on available RAM.
+#   GOMEMLIMIT: soft cap (Go GC triggers before exceeding this).
+#   GOGC: GC aggressiveness (default 100; lower = more frequent GC).
+# On >=512MB hosts: no tuning (defaults are fine).
+# On 128-256MB hosts: GOMEMLIMIT=128MiB, GOGC=50.
+# On <128MB hosts:  GOMEMLIMIT=64MiB,  GOGC=25.
+# Override via THREE_M_UI_GOMEMLIMIT / THREE_M_UI_GOGC env vars.
+Environment=GOMEMLIMIT=${PANEL_GOMEMLIMIT}
+Environment=GOGC=${PANEL_GOGC}
 WorkingDirectory=$DATA_DIR
 Restart=always
 RestartSec=5
@@ -372,6 +418,9 @@ LockPersonality=true
 SystemCallArchitectures=native
 NoNewPrivileges=true
 LimitNOFILE=65535
+# systemd hard memory cap (OOM kill safety). Set to 1.5x GOMEMLIMIT
+# so the Go runtime can GC before systemd intervenes.
+MemoryMax=${PANEL_MEMORYMAX}
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 [Install]
